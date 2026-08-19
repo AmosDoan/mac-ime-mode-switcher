@@ -143,50 +143,36 @@ enum KeyNames {
     }
 }
 
-// MARK: - Global hotkey (Carbon) for the Japanese key
+// MARK: - Global key tap
 
-final class HotKey {
-    private var ref: EventHotKeyRef?
-    private var handler: EventHandlerRef?
-    private let onFire: () -> Void
-
-    init(keyCode: UInt32, modifiers: UInt32, onFire: @escaping () -> Void) {
-        self.onFire = onFire
-        install(keyCode: keyCode, modifiers: modifiers)
-    }
-
-    private func install(keyCode: UInt32, modifiers: UInt32) {
-        var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard),
-                                 eventKind: UInt32(kEventHotKeyPressed))
-        let selfPtr = Unmanaged.passUnretained(self).toOpaque()
-        InstallEventHandler(GetApplicationEventTarget(), { _, _, userData -> OSStatus in
-            guard let userData = userData else { return noErr }
-            let me = Unmanaged<HotKey>.fromOpaque(userData).takeUnretainedValue()
-            DispatchQueue.main.async { me.onFire() }
-            return noErr
-        }, 1, &spec, selfPtr, &handler)
-
-        let hotKeyID = EventHotKeyID(signature: OSType(0x494D4553) /* 'IMES' */, id: 1)
-        RegisterEventHotKey(keyCode, modifiers, hotKeyID, GetApplicationEventTarget(), 0, &ref)
-    }
-
-    deinit {
-        if let ref = ref { UnregisterEventHotKey(ref) }
-        if let handler = handler { RemoveEventHandler(handler) }
-    }
+/// CGEventFlags for the four modifiers described by a HotKeyConfig.
+func cgFlags(from carbon: UInt32) -> CGEventFlags {
+    var f: CGEventFlags = []
+    if carbon & UInt32(cmdKey)     != 0 { f.insert(.maskCommand) }
+    if carbon & UInt32(optionKey)  != 0 { f.insert(.maskAlternate) }
+    if carbon & UInt32(controlKey) != 0 { f.insert(.maskControl) }
+    if carbon & UInt32(shiftKey)   != 0 { f.insert(.maskShift) }
+    return f
 }
 
-// MARK: - shift+space event tap
-
-/// Intercepts shift+space globally and swaps 한 ↔ 영 ourselves, swallowing the
-/// system's "select next input source" so it can never overshoot into 日本語/Ainu.
-final class ShiftSpaceTap {
+/// Intercepts key input globally: shift+space swaps 한 ↔ 영, and the configured
+/// Japanese combo selects 日本語. Both are *swallowed*, so the system's input-source
+/// cycle never overshoots and other apps (Notion 등) never see the Japanese combo.
+final class KeyTap {
     private var tap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
     private let onShiftSpace: () -> Void
+    private let onJapanese: () -> Void
+    private let jpConfig: () -> HotKeyConfig
 
-    init?(onShiftSpace: @escaping () -> Void) {
+    private static let modMask: CGEventFlags = [.maskCommand, .maskAlternate, .maskControl, .maskShift]
+
+    init?(jpConfig: @escaping () -> HotKeyConfig,
+          onShiftSpace: @escaping () -> Void,
+          onJapanese: @escaping () -> Void) {
+        self.jpConfig = jpConfig
         self.onShiftSpace = onShiftSpace
+        self.onJapanese = onJapanese
         let mask = CGEventMask(1 << CGEventType.keyDown.rawValue)
         let selfPtr = Unmanaged.passUnretained(self).toOpaque()
         guard let tap = CGEvent.tapCreate(
@@ -194,7 +180,7 @@ final class ShiftSpaceTap {
             options: .defaultTap, eventsOfInterest: mask,
             callback: { _, type, event, userInfo -> Unmanaged<CGEvent>? in
                 guard let userInfo = userInfo else { return Unmanaged.passUnretained(event) }
-                let me = Unmanaged<ShiftSpaceTap>.fromOpaque(userInfo).takeUnretainedValue()
+                let me = Unmanaged<KeyTap>.fromOpaque(userInfo).takeUnretainedValue()
                 return me.handle(type: type, event: event)
             }, userInfo: selfPtr)
         else { return nil }
@@ -214,14 +200,19 @@ final class ShiftSpaceTap {
         guard type == .keyDown else { return Unmanaged.passUnretained(event) }
 
         let keyCode = event.getIntegerValueField(.keyboardEventKeycode)
-        let flags = event.flags
-        let shift = flags.contains(.maskShift)
-        let otherMods = flags.contains(.maskCommand) || flags.contains(.maskAlternate)
-            || flags.contains(.maskControl)
+        let mods = event.flags.intersection(Self.modMask)
 
-        if keyCode == Int64(kVK_Space) && shift && !otherMods {
+        // shift+space (and nothing else) → 한 ↔ 영
+        if keyCode == Int64(kVK_Space) && mods == .maskShift {
             DispatchQueue.main.async { self.onShiftSpace() }
-            return nil // swallow: the system never runs its own switch
+            return nil
+        }
+
+        // configured Japanese combo → 日本語 (swallowed, so Notion never sees it)
+        let jp = jpConfig()
+        if keyCode == Int64(jp.keyCode) && mods == cgFlags(from: jp.carbonModifiers) {
+            DispatchQueue.main.async { self.onJapanese() }
+            return nil
         }
         return Unmanaged.passUnretained(event)
     }
@@ -340,8 +331,7 @@ final class PreferencesWindowController: NSWindowController {
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
-    private var jpHotKey: HotKey?
-    private var tap: ShiftSpaceTap?
+    private var tap: KeyTap?
     private var jpConfig = HotKeyConfig.load()
     private var jpHotkeyMenuItem: NSMenuItem!
     private var prefsController: PreferencesWindowController?
@@ -349,16 +339,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         buildMenu()
-        registerJapaneseHotKey()
         setupTap()
         observeInputChanges()
         refreshGlyph()
     }
 
-    // MARK: shift+space tap (needs Accessibility permission)
+    // MARK: key tap (needs Accessibility permission)
 
     private func setupTap() {
-        tap = ShiftSpaceTap { [weak self] in self?.toggleKoreanEnglish() }
+        tap = KeyTap(
+            jpConfig: { [weak self] in self?.jpConfig ?? .defaultConfig },
+            onShiftSpace: { [weak self] in self?.toggleKoreanEnglish() },
+            onJapanese: { [weak self] in self?.selectJapanese() })
         if tap == nil { promptForAccessibility() }
     }
 
@@ -391,15 +383,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func menuEnglish()  { selectSource(Config.english) }
     @objc private func menuKorean()   { selectSource(Config.korean) }
     @objc private func menuJapanese() { selectJapanese() }
-
-    // MARK: hotkey
-
-    private func registerJapaneseHotKey() {
-        jpHotKey = HotKey(keyCode: jpConfig.keyCode, modifiers: jpConfig.carbonModifiers) { [weak self] in
-            self?.selectJapanese()
-        }
-        jpHotkeyMenuItem?.title = "일본어 단축키: \(jpConfig.display)"
-    }
 
     // MARK: menu / indicator
 
@@ -454,7 +437,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 guard let self = self else { return }
                 self.jpConfig = newConfig
                 newConfig.save()
-                self.registerJapaneseHotKey()
+                // The tap reads jpConfig live, so no re-registration is needed.
+                self.jpHotkeyMenuItem?.title = "일본어 단축키: \(newConfig.display)"
             }
         }
         prefsController?.show()
