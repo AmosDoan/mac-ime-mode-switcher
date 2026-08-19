@@ -2,119 +2,66 @@ import AppKit
 import Carbon
 import Carbon.HIToolbox
 
+// MARK: - Configuration
+
+/// Input source IDs. Run scripts/list-sources.sh to find yours.
+enum Config {
+    static let english  = "com.apple.keylayout.ABC"
+    static let korean   = "com.apple.inputmethod.Korean.2SetKorean"
+    static let japanese = "com.apple.inputmethod.Kotoeri.RomajiTyping.Japanese"
+
+    /// Any source whose ID starts with this is treated as Korean.
+    static let koreanPrefix   = "com.apple.inputmethod.Korean"
+    static let japanesePrefix = "com.apple.inputmethod.Kotoeri"
+}
+
 // MARK: - Input source helpers
 
-/// Reads a CFString property from a TIS input source.
-func stringProperty(_ source: TISInputSource, _ key: CFString) -> String? {
-    guard let ptr = TISGetInputSourceProperty(source, key) else { return nil }
+func sourceID(_ source: TISInputSource) -> String {
+    guard let ptr = TISGetInputSourceProperty(source, kTISPropertyInputSourceID) else { return "" }
     return Unmanaged<CFString>.fromOpaque(ptr).takeUnretainedValue() as String
 }
 
-/// Reads a CFBoolean property from a TIS input source.
-func boolProperty(_ source: TISInputSource, _ key: CFString) -> Bool {
-    guard let ptr = TISGetInputSourceProperty(source, key) else { return false }
-    return CFBooleanGetValue(Unmanaged<CFBoolean>.fromOpaque(ptr).takeUnretainedValue())
+/// The ID of the currently active keyboard input source.
+func currentSourceID() -> String {
+    guard let src = TISCopyCurrentKeyboardInputSource()?.takeRetainedValue() else { return "" }
+    return sourceID(src)
 }
 
-struct SourceInfo {
-    let source: TISInputSource
-    let id: String
-    let bundleID: String
-    let selectable: Bool
-    let enabled: Bool
-    let category: String
+func findSource(_ id: String) -> TISInputSource? {
+    guard let list = TISCreateInputSourceList(nil, true)?.takeRetainedValue() as? [TISInputSource] else { return nil }
+    return list.first { sourceID($0) == id }
 }
 
-/// Enumerates every installed keyboard input source (layouts + input modes).
-func allInstalledSources() -> [SourceInfo] {
-    guard let cfList = TISCreateInputSourceList(nil, true)?.takeRetainedValue() else { return [] }
-    let list = cfList as! [TISInputSource]
-    var result: [SourceInfo] = []
-    for src in list {
-        let id = stringProperty(src, kTISPropertyInputSourceID) ?? ""
-        let bundle = stringProperty(src, kTISPropertyBundleID) ?? ""
-        let category = stringProperty(src, kTISPropertyInputSourceCategory) ?? ""
-        // Keep only keyboard layouts and keyboard input modes.
-        guard category == (kTISCategoryKeyboardInputSource as String) else { continue }
-        result.append(SourceInfo(
-            source: src,
-            id: id,
-            bundleID: bundle,
-            selectable: boolProperty(src, kTISPropertyInputSourceIsSelectCapable),
-            enabled: boolProperty(src, kTISPropertyInputSourceIsEnabled),
-            category: category
-        ))
+/// Selects a source by ID, enabling it first if macOS reports it disabled.
+/// (Enable works reliably; disable does not, so we never rely on disabling.)
+func selectSource(_ id: String) {
+    guard var src = findSource(id) else { return }
+    let enabledPtr = TISGetInputSourceProperty(src, kTISPropertyInputSourceIsEnabled)
+    let enabled = enabledPtr.map { CFBooleanGetValue(Unmanaged<CFBoolean>.fromOpaque($0).takeUnretainedValue()) } ?? false
+    if !enabled {
+        TISEnableInputSource(src)
+        if let refreshed = findSource(id) { src = refreshed }
     }
-    return result
+    TISSelectInputSource(src)
 }
 
-// MARK: - Configuration
+enum InputLang {
+    case english, korean, japanese, other
 
-/// Exact input source IDs that make up each mode.
-/// Edit these if you use different layouts (run scripts/list-sources.sh to see IDs).
-enum Config {
-    /// 한/영 모드: English + Korean 2-set. 처음 진입 시 English로 시작합니다.
-    static let krEn = ["com.apple.keylayout.ABC",
-                       "com.apple.inputmethod.Korean.2SetKorean"]
-    static let krEnPrimary = "com.apple.keylayout.ABC"
+    static func of(_ id: String) -> InputLang {
+        if id == Config.english { return .english }
+        if id.hasPrefix(Config.koreanPrefix) { return .korean }
+        if id.hasPrefix(Config.japanesePrefix) { return .japanese }
+        return .other
+    }
 
-    /// 일본어 모드: 로마자 입력(히라가나)만. 英数 전환은 IME 안에서 됩니다.
-    static let jp = ["com.apple.inputmethod.Kotoeri.RomajiTyping.Japanese"]
-    static let jpPrimary = "com.apple.inputmethod.Kotoeri.RomajiTyping.Japanese"
-}
-
-enum Mode {
-    case krEn
-    case jp
-
-    var title: String {
+    var glyph: String {
         switch self {
-        case .krEn: return "한/A"
-        case .jp:   return "あ"
-        }
-    }
-
-    var menuLabel: String {
-        switch self {
-        case .krEn: return "현재: 한/영 모드"
-        case .jp:   return "현재: 일본어 모드"
-        }
-    }
-}
-
-// MARK: - Mode switching engine
-
-final class ModeSwitcher {
-    /// Applies the given mode: enable exactly the wanted sources, select the primary,
-    /// then disable every other currently-enabled source so shift+space 순환에는
-    /// 딱 원하는 것만 남습니다 (Kana 일본어·아이누어 등 원치 않는 소스 제거).
-    func apply(_ mode: Mode) {
-        let wantedIDs: [String]
-        let primaryID: String
-        switch mode {
-        case .krEn: wantedIDs = Config.krEn; primaryID = Config.krEnPrimary
-        case .jp:   wantedIDs = Config.jp;   primaryID = Config.jpPrimary
-        }
-
-        let sources = allInstalledSources()
-        let byID = Dictionary(sources.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
-
-        // 1. Enable every wanted source first.
-        for id in wantedIDs {
-            if let info = byID[id], !info.enabled {
-                TISEnableInputSource(info.source)
-            }
-        }
-
-        // 2. Select the primary source for this mode.
-        if let primary = byID[primaryID] {
-            TISSelectInputSource(primary.source)
-        }
-
-        // 3. Disable every other currently-enabled selectable source.
-        let wantedSet = Set(wantedIDs)
-        for info in sources where info.enabled && info.selectable && !wantedSet.contains(info.id) {
-            TISDisableInputSource(info.source)
+        case .english:  return "A"
+        case .korean:   return "한"
+        case .japanese: return "あ"
+        case .other:    return "•"
         }
     }
 }
@@ -125,24 +72,23 @@ struct HotKeyConfig: Equatable {
     var keyCode: UInt32
     var carbonModifiers: UInt32
 
-    /// Default: ⌥⌘J (option-command-J).
+    /// Default: ⌥⌘J (option-command-J) for Japanese.
     static let defaultConfig = HotKeyConfig(keyCode: UInt32(kVK_ANSI_J),
                                             carbonModifiers: UInt32(optionKey | cmdKey))
 
     static func load() -> HotKeyConfig {
         let d = UserDefaults.standard
-        guard d.object(forKey: "hotkey.keyCode") != nil else { return .defaultConfig }
-        return HotKeyConfig(keyCode: UInt32(d.integer(forKey: "hotkey.keyCode")),
-                            carbonModifiers: UInt32(d.integer(forKey: "hotkey.carbonMods")))
+        guard d.object(forKey: "jpHotkey.keyCode") != nil else { return .defaultConfig }
+        return HotKeyConfig(keyCode: UInt32(d.integer(forKey: "jpHotkey.keyCode")),
+                            carbonModifiers: UInt32(d.integer(forKey: "jpHotkey.carbonMods")))
     }
 
     func save() {
         let d = UserDefaults.standard
-        d.set(Int(keyCode), forKey: "hotkey.keyCode")
-        d.set(Int(carbonModifiers), forKey: "hotkey.carbonMods")
+        d.set(Int(keyCode), forKey: "jpHotkey.keyCode")
+        d.set(Int(carbonModifiers), forKey: "jpHotkey.carbonMods")
     }
 
-    /// e.g. "⌥⌘J" — a readable label for menus and the settings window.
     var display: String {
         var s = ""
         if carbonModifiers & UInt32(controlKey) != 0 { s += "⌃" }
@@ -153,7 +99,6 @@ struct HotKeyConfig: Equatable {
     }
 }
 
-/// Translates NSEvent modifier flags into Carbon hotkey modifier masks.
 func carbonModifiers(from flags: NSEvent.ModifierFlags) -> UInt32 {
     var m: UInt32 = 0
     if flags.contains(.command) { m |= UInt32(cmdKey) }
@@ -163,8 +108,6 @@ func carbonModifiers(from flags: NSEvent.ModifierFlags) -> UInt32 {
     return m
 }
 
-/// Human-readable names for a handful of virtual key codes; letters/digits fall
-/// back to their typed character, everything else to "key<N>".
 enum KeyNames {
     private static let special: [UInt32: String] = [
         UInt32(kVK_Space): "Space", UInt32(kVK_Return): "Return",
@@ -181,7 +124,6 @@ enum KeyNames {
         return "key\(keyCode)"
     }
 
-    /// Resolves the character a key produces using the current keyboard layout.
     private static func character(for keyCode: UInt32) -> String? {
         guard let src = TISCopyCurrentKeyboardLayoutInputSource()?.takeRetainedValue(),
               let ptr = TISGetInputSourceProperty(src, kTISPropertyUnicodeKeyLayoutData)
@@ -201,7 +143,7 @@ enum KeyNames {
     }
 }
 
-// MARK: - Global hotkey (Carbon, no accessibility permission needed)
+// MARK: - Global hotkey (Carbon) for the Japanese key
 
 final class HotKey {
     private var ref: EventHotKeyRef?
@@ -234,9 +176,64 @@ final class HotKey {
     }
 }
 
-// MARK: - Shortcut recorder button
+// MARK: - shift+space event tap
 
-/// A button that, while armed, captures the next modifier+key combo the user presses.
+/// Intercepts shift+space globally and swaps 한 ↔ 영 ourselves, swallowing the
+/// system's "select next input source" so it can never overshoot into 日本語/Ainu.
+final class ShiftSpaceTap {
+    private var tap: CFMachPort?
+    private var runLoopSource: CFRunLoopSource?
+    private let onShiftSpace: () -> Void
+
+    init?(onShiftSpace: @escaping () -> Void) {
+        self.onShiftSpace = onShiftSpace
+        let mask = CGEventMask(1 << CGEventType.keyDown.rawValue)
+        let selfPtr = Unmanaged.passUnretained(self).toOpaque()
+        guard let tap = CGEvent.tapCreate(
+            tap: .cgSessionEventTap, place: .headInsertEventTap,
+            options: .defaultTap, eventsOfInterest: mask,
+            callback: { _, type, event, userInfo -> Unmanaged<CGEvent>? in
+                guard let userInfo = userInfo else { return Unmanaged.passUnretained(event) }
+                let me = Unmanaged<ShiftSpaceTap>.fromOpaque(userInfo).takeUnretainedValue()
+                return me.handle(type: type, event: event)
+            }, userInfo: selfPtr)
+        else { return nil }
+
+        self.tap = tap
+        runLoopSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
+        CFRunLoopAddSource(CFRunLoopGetCurrent(), runLoopSource, .commonModes)
+        CGEvent.tapEnable(tap: tap, enable: true)
+    }
+
+    private func handle(type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
+        // The system disables a tap that is slow or gets interrupted; re-arm it.
+        if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+            if let tap = tap { CGEvent.tapEnable(tap: tap, enable: true) }
+            return Unmanaged.passUnretained(event)
+        }
+        guard type == .keyDown else { return Unmanaged.passUnretained(event) }
+
+        let keyCode = event.getIntegerValueField(.keyboardEventKeycode)
+        let flags = event.flags
+        let shift = flags.contains(.maskShift)
+        let otherMods = flags.contains(.maskCommand) || flags.contains(.maskAlternate)
+            || flags.contains(.maskControl)
+
+        if keyCode == Int64(kVK_Space) && shift && !otherMods {
+            DispatchQueue.main.async { self.onShiftSpace() }
+            return nil // swallow: the system never runs its own switch
+        }
+        return Unmanaged.passUnretained(event)
+    }
+
+    deinit {
+        if let s = runLoopSource { CFRunLoopRemoveSource(CFRunLoopGetCurrent(), s, .commonModes) }
+        if let t = tap { CGEvent.tapEnable(tap: t, enable: false) }
+    }
+}
+
+// MARK: - Shortcut recorder + Preferences (for the Japanese key)
+
 final class RecorderButton: NSButton {
     var onCapture: ((HotKeyConfig) -> Void)?
     private var recording = false
@@ -254,18 +251,13 @@ final class RecorderButton: NSButton {
     }
     required init?(coder: NSCoder) { fatalError() }
 
-    func update(config: HotKeyConfig) {
-        currentConfig = config
-        refreshTitle()
-    }
+    func update(config: HotKeyConfig) { currentConfig = config; refreshTitle() }
 
     private func refreshTitle() {
         title = recording ? "키 조합을 누르세요… (Esc 취소)" : currentConfig.display
     }
 
-    @objc private func toggle() {
-        recording ? stop() : start()
-    }
+    @objc private func toggle() { recording ? stop() : start() }
 
     private func start() {
         recording = true
@@ -274,7 +266,6 @@ final class RecorderButton: NSButton {
             guard let self = self else { return event }
             if event.keyCode == UInt16(kVK_Escape) { self.stop(); return nil }
             let mods = carbonModifiers(from: event.modifierFlags)
-            // Require at least one modifier so we don't grab bare keys.
             guard mods != 0 else { return nil }
             let config = HotKeyConfig(keyCode: UInt32(event.keyCode), carbonModifiers: mods)
             self.currentConfig = config
@@ -291,17 +282,14 @@ final class RecorderButton: NSButton {
     }
 }
 
-// MARK: - Preferences window
-
 final class PreferencesWindowController: NSWindowController {
     private let onChange: (HotKeyConfig) -> Void
     private var recorder: RecorderButton!
 
     init(config: HotKeyConfig, onChange: @escaping (HotKeyConfig) -> Void) {
         self.onChange = onChange
-        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 380, height: 150),
-                              styleMask: [.titled, .closable],
-                              backing: .buffered, defer: false)
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 400, height: 170),
+                              styleMask: [.titled, .closable], backing: .buffered, defer: false)
         window.title = "IME Mode Switcher 설정"
         super.init(window: window)
         buildContent(config: config)
@@ -312,26 +300,28 @@ final class PreferencesWindowController: NSWindowController {
     private func buildContent(config: HotKeyConfig) {
         guard let content = window?.contentView else { return }
 
-        let label = NSTextField(labelWithString: "모드 전환 단축키")
-        label.frame = NSRect(x: 20, y: 100, width: 340, height: 20)
+        let info = NSTextField(labelWithString: "shift+space = 한 ↔ 영 (고정)")
+        info.frame = NSRect(x: 20, y: 122, width: 360, height: 20)
+        content.addSubview(info)
+
+        let label = NSTextField(labelWithString: "일본어 전환 단축키")
+        label.frame = NSRect(x: 20, y: 92, width: 360, height: 20)
         content.addSubview(label)
 
         recorder = RecorderButton(config: config)
-        recorder.frame = NSRect(x: 20, y: 62, width: 260, height: 30)
-        recorder.onCapture = { [weak self] cfg in
-            self?.onChange(cfg)
-        }
+        recorder.frame = NSRect(x: 20, y: 54, width: 280, height: 30)
+        recorder.onCapture = { [weak self] cfg in self?.onChange(cfg) }
         content.addSubview(recorder)
 
         let reset = NSButton(title: "기본값", target: self, action: #selector(resetToDefault))
         reset.bezelStyle = .rounded
-        reset.frame = NSRect(x: 285, y: 62, width: 75, height: 30)
+        reset.frame = NSRect(x: 305, y: 54, width: 75, height: 30)
         content.addSubview(reset)
 
         let hint = NSTextField(labelWithString: "버튼을 누른 뒤 원하는 조합(예: ⌥⌘J)을 눌러 지정합니다.")
         hint.font = .systemFont(ofSize: 11)
         hint.textColor = .secondaryLabelColor
-        hint.frame = NSRect(x: 20, y: 24, width: 340, height: 20)
+        hint.frame = NSRect(x: 20, y: 20, width: 360, height: 20)
         content.addSubview(hint)
     }
 
@@ -350,52 +340,90 @@ final class PreferencesWindowController: NSWindowController {
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
-    private let switcher = ModeSwitcher()
-    private var hotKey: HotKey?
-    private var config = HotKeyConfig.load()
-    private var mode: Mode = .krEn {
-        didSet { refreshUI() }
-    }
-    private var modeMenuItem: NSMenuItem!
-    private var hotkeyMenuItem: NSMenuItem!
+    private var jpHotKey: HotKey?
+    private var tap: ShiftSpaceTap?
+    private var jpConfig = HotKeyConfig.load()
+    private var jpHotkeyMenuItem: NSMenuItem!
     private var prefsController: PreferencesWindowController?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         buildMenu()
-        registerHotKey()
-
-        // Establish a known state on launch: 한/영 모드.
-        setMode(.krEn)
+        registerJapaneseHotKey()
+        setupTap()
+        observeInputChanges()
+        refreshGlyph()
     }
 
-    private func registerHotKey() {
-        hotKey = HotKey(keyCode: config.keyCode, modifiers: config.carbonModifiers) { [weak self] in
-            self?.toggleMode()
+    // MARK: shift+space tap (needs Accessibility permission)
+
+    private func setupTap() {
+        tap = ShiftSpaceTap { [weak self] in self?.toggleKoreanEnglish() }
+        if tap == nil { promptForAccessibility() }
+    }
+
+    private func promptForAccessibility() {
+        // Triggers the system prompt and points the user to the right settings pane.
+        let opts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+        _ = AXIsProcessTrustedWithOptions(opts)
+
+        let alert = NSAlert()
+        alert.messageText = "손쉬운 사용 권한이 필요합니다"
+        alert.informativeText = "shift+space 를 가로채 한/영을 전환하려면 접근성 권한이 필요합니다.\n"
+            + "시스템 설정 > 개인정보 보호 및 보안 > 손쉬운 사용 에서 IMEModeSwitcher 를 켠 뒤 앱을 다시 실행해 주세요."
+        alert.addButton(withTitle: "설정 열기")
+        alert.addButton(withTitle: "나중에")
+        NSApp.activate(ignoringOtherApps: true)
+        if alert.runModal() == .alertFirstButtonReturn {
+            let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!
+            NSWorkspace.shared.open(url)
         }
-        hotkeyMenuItem?.title = "단축키: \(config.display) (모드 토글)"
     }
+
+    // MARK: switching
+
+    private func toggleKoreanEnglish() {
+        let cur = InputLang.of(currentSourceID())
+        selectSource(cur == .korean ? Config.english : Config.korean)
+    }
+
+    private func selectJapanese() { selectSource(Config.japanese) }
+    @objc private func menuEnglish()  { selectSource(Config.english) }
+    @objc private func menuKorean()   { selectSource(Config.korean) }
+    @objc private func menuJapanese() { selectJapanese() }
+
+    // MARK: hotkey
+
+    private func registerJapaneseHotKey() {
+        jpHotKey = HotKey(keyCode: jpConfig.keyCode, modifiers: jpConfig.carbonModifiers) { [weak self] in
+            self?.selectJapanese()
+        }
+        jpHotkeyMenuItem?.title = "일본어 단축키: \(jpConfig.display)"
+    }
+
+    // MARK: menu / indicator
 
     private func buildMenu() {
         let menu = NSMenu()
-        modeMenuItem = NSMenuItem(title: mode.menuLabel, action: nil, keyEquivalent: "")
-        modeMenuItem.isEnabled = false
-        menu.addItem(modeMenuItem)
-        menu.addItem(.separator())
 
-        let toKrEn = NSMenuItem(title: "한/영 모드로 전환", action: #selector(switchToKrEn), keyEquivalent: "")
-        toKrEn.target = self
-        menu.addItem(toKrEn)
+        let ss = NSMenuItem(title: "shift+space: 한 ↔ 영", action: nil, keyEquivalent: "")
+        ss.isEnabled = false
+        menu.addItem(ss)
 
-        let toJp = NSMenuItem(title: "일본어 모드로 전환", action: #selector(switchToJp), keyEquivalent: "")
-        toJp.target = self
-        menu.addItem(toJp)
+        jpHotkeyMenuItem = NSMenuItem(title: "일본어 단축키: \(jpConfig.display)", action: nil, keyEquivalent: "")
+        jpHotkeyMenuItem.isEnabled = false
+        menu.addItem(jpHotkeyMenuItem)
 
         menu.addItem(.separator())
-        hotkeyMenuItem = NSMenuItem(title: "단축키: \(config.display) (모드 토글)", action: nil, keyEquivalent: "")
-        hotkeyMenuItem.isEnabled = false
-        menu.addItem(hotkeyMenuItem)
+        for (title, sel) in [("English (ABC)", #selector(menuEnglish)),
+                             ("한국어", #selector(menuKorean)),
+                             ("日本語", #selector(menuJapanese))] {
+            let item = NSMenuItem(title: title, action: sel, keyEquivalent: "")
+            item.target = self
+            menu.addItem(item)
+        }
 
+        menu.addItem(.separator())
         let prefs = NSMenuItem(title: "설정…", action: #selector(openPreferences), keyEquivalent: ",")
         prefs.target = self
         menu.addItem(prefs)
@@ -405,33 +433,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(quit)
 
         statusItem.menu = menu
-        refreshUI()
     }
 
-    private func refreshUI() {
-        statusItem?.button?.title = mode.title
-        modeMenuItem?.title = mode.menuLabel
+    private func observeInputChanges() {
+        DistributedNotificationCenter.default().addObserver(
+            self, selector: #selector(refreshGlyph),
+            name: NSNotification.Name(kTISNotifySelectedKeyboardInputSourceChanged as String),
+            object: nil)
     }
 
-    func toggleMode() {
-        setMode(mode == .krEn ? .jp : .krEn)
+    @objc private func refreshGlyph() {
+        DispatchQueue.main.async {
+            self.statusItem?.button?.title = InputLang.of(currentSourceID()).glyph
+        }
     }
-
-    private func setMode(_ newMode: Mode) {
-        switcher.apply(newMode)
-        mode = newMode
-    }
-
-    @objc private func switchToKrEn() { setMode(.krEn) }
-    @objc private func switchToJp() { setMode(.jp) }
 
     @objc private func openPreferences() {
         if prefsController == nil {
-            prefsController = PreferencesWindowController(config: config) { [weak self] newConfig in
+            prefsController = PreferencesWindowController(config: jpConfig) { [weak self] newConfig in
                 guard let self = self else { return }
-                self.config = newConfig
+                self.jpConfig = newConfig
                 newConfig.save()
-                self.registerHotKey() // re-registers with the new combo
+                self.registerJapaneseHotKey()
             }
         }
         prefsController?.show()
