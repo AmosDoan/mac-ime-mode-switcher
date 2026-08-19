@@ -114,8 +114,18 @@ enum KeyNames {
         UInt32(kVK_F10): "F10", UInt32(kVK_F11): "F11", UInt32(kVK_F12): "F12",
     ]
 
+    /// ANSI virtual keycodes → characters (layout-independent, for display only).
+    private static let ansi: [UInt32: String] = [
+        0:"A",1:"S",2:"D",3:"F",4:"H",5:"G",6:"Z",7:"X",8:"C",9:"V",11:"B",12:"Q",
+        13:"W",14:"E",15:"R",16:"Y",17:"T",18:"1",19:"2",20:"3",21:"4",22:"6",23:"5",
+        24:"=",25:"9",26:"7",27:"-",28:"8",29:"0",30:"]",31:"O",32:"U",33:"[",34:"I",
+        35:"P",37:"L",38:"J",39:"'",40:"K",41:";",42:"\\",43:",",44:"/",45:"N",46:"M",
+        47:".",50:"`",
+    ]
+
     static func name(for keyCode: UInt32) -> String {
         if let s = special[keyCode] { return s }
+        if let s = ansi[keyCode] { return s }
         if let ch = character(for: keyCode) { return ch.uppercased() }
         return "key\(keyCode)"
     }
@@ -330,7 +340,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var tap: KeyTap?
     private var jpConfig = HotKeyConfig.load()
     private var jpHotkeyMenuItem: NSMenuItem!
+    private var tapStatusMenuItem: NSMenuItem!
     private var prefsController: PreferencesWindowController?
+
+    private var permissionTimer: Timer?
+    private var didPrompt = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -338,16 +352,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         setupTap()
         observeInputChanges()
         refreshGlyph()
+
+        // If permission isn't granted yet, keep trying so the user never has to
+        // relaunch: the tap activates the moment they flip the switch in Settings.
+        permissionTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+            guard let self = self, self.tap == nil else { return }
+            if AXIsProcessTrusted() { self.setupTap() }
+        }
     }
 
     // MARK: key tap (needs Accessibility permission)
 
     private func setupTap() {
+        guard tap == nil else { return }
         tap = KeyTap(
             jpConfig: { [weak self] in self?.jpConfig ?? .defaultConfig },
             onShiftSpace: { [weak self] in self?.toggleKoreanEnglish() },
             onJapanese: { [weak self] in self?.selectJapanese() })
-        if tap == nil { promptForAccessibility() }
+        if tap != nil {
+            permissionTimer?.invalidate(); permissionTimer = nil
+        } else if !didPrompt {
+            didPrompt = true
+            promptForAccessibility()
+        }
+        updateTapStatusMenu()
     }
 
     private func promptForAccessibility() {
@@ -397,6 +425,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func buildMenu() {
         let menu = NSMenu()
 
+        tapStatusMenuItem = NSMenuItem(title: "가로채기: 확인 중…", action: nil, keyEquivalent: "")
+        tapStatusMenuItem.isEnabled = false
+        menu.addItem(tapStatusMenuItem)
+
         let ss = NSMenuItem(title: "shift+space: 한 ↔ 영", action: nil, keyEquivalent: "")
         ss.isEnabled = false
         menu.addItem(ss)
@@ -431,6 +463,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self, selector: #selector(refreshGlyph),
             name: NSNotification.Name(kTISNotifySelectedKeyboardInputSourceChanged as String),
             object: nil)
+    }
+
+    private func updateTapStatusMenu() {
+        tapStatusMenuItem?.title = tap != nil ? "가로채기: 켜짐 ✓" : "가로채기: 꺼짐 (권한 필요)"
     }
 
     @objc private func refreshGlyph() {
