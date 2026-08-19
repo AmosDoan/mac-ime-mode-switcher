@@ -30,7 +30,14 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 </plist>
 PLIST
 
-# Ad-hoc code signature so the global hotkey / status item behave consistently.
-codesign --force --sign - "$APP" 2>/dev/null || true
+# Sign with a stable self-signed identity if present so the Accessibility grant
+# survives rebuilds; otherwise fall back to an ad-hoc signature.
+IDENTITY="IMEModeSwitcher Local Signing"
+if codesign --force --deep -s "$IDENTITY" "$APP" 2>/dev/null; then
+    echo "Signed with: $IDENTITY"
+else
+    codesign --force --sign - "$APP" 2>/dev/null || true
+    echo "Signed ad-hoc (stable identity not found)"
+fi
 
 echo "Built: $APP"

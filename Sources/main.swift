@@ -1,6 +1,7 @@
 import AppKit
 import Carbon
 import Carbon.HIToolbox
+import ServiceManagement
 
 // MARK: - Configuration
 
@@ -335,12 +336,13 @@ final class PreferencesWindowController: NSWindowController {
 
 // MARK: - App
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem!
     private var tap: KeyTap?
     private var jpConfig = HotKeyConfig.load()
     private var jpHotkeyMenuItem: NSMenuItem!
     private var tapStatusMenuItem: NSMenuItem!
+    private var loginItemMenuItem: NSMenuItem!
     private var prefsController: PreferencesWindowController?
 
     private var permissionTimer: Timer?
@@ -447,6 +449,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         menu.addItem(.separator())
+        loginItemMenuItem = NSMenuItem(title: "로그인 시 자동 실행", action: #selector(toggleLoginItem), keyEquivalent: "")
+        loginItemMenuItem.target = self
+        menu.addItem(loginItemMenuItem)
+
         let prefs = NSMenuItem(title: "설정…", action: #selector(openPreferences), keyEquivalent: ",")
         prefs.target = self
         menu.addItem(prefs)
@@ -455,7 +461,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let quit = NSMenuItem(title: "종료", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         menu.addItem(quit)
 
+        menu.delegate = self
         statusItem.menu = menu
+        refreshLoginItemState()
+    }
+
+    // Refresh dynamic states right before the menu is shown.
+    func menuWillOpen(_ menu: NSMenu) {
+        updateTapStatusMenu()
+        refreshLoginItemState()
+        refreshGlyph()
     }
 
     private func observeInputChanges() {
@@ -467,6 +482,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func updateTapStatusMenu() {
         tapStatusMenuItem?.title = tap != nil ? "가로채기: 켜짐 ✓" : "가로채기: 꺼짐 (권한 필요)"
+    }
+
+    private func refreshLoginItemState() {
+        loginItemMenuItem?.state = (SMAppService.mainApp.status == .enabled) ? .on : .off
+    }
+
+    @objc private func toggleLoginItem() {
+        do {
+            if SMAppService.mainApp.status == .enabled {
+                try SMAppService.mainApp.unregister()
+            } else {
+                try SMAppService.mainApp.register()
+            }
+        } catch {
+            let alert = NSAlert()
+            alert.messageText = "로그인 항목 설정에 실패했습니다"
+            alert.informativeText = error.localizedDescription
+            alert.runModal()
+        }
+        refreshLoginItemState()
     }
 
     @objc private func refreshGlyph() {
