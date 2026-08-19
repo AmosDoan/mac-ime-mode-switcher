@@ -33,17 +33,13 @@ func findSource(_ id: String) -> TISInputSource? {
     return list.first { sourceID($0) == id }
 }
 
-/// Selects a source by ID, enabling it first if macOS reports it disabled.
-/// (Enable works reliably; disable does not, so we never rely on disabling.)
-func selectSource(_ id: String) {
-    guard var src = findSource(id) else { return }
-    let enabledPtr = TISGetInputSourceProperty(src, kTISPropertyInputSourceIsEnabled)
-    let enabled = enabledPtr.map { CFBooleanGetValue(Unmanaged<CFBoolean>.fromOpaque($0).takeUnretainedValue()) } ?? false
-    if !enabled {
-        TISEnableInputSource(src)
-        if let refreshed = findSource(id) { src = refreshed }
-    }
-    TISSelectInputSource(src)
+/// Selects a source by ID. The source must already be enabled in System Settings —
+/// programmatic enable/disable is unreliable on recent macOS, so we never touch it.
+/// Returns the OSStatus (0 == success; -50 usually means the source isn't enabled).
+@discardableResult
+func selectSource(_ id: String) -> OSStatus {
+    guard let src = findSource(id) else { return OSStatus(-50) }
+    return TISSelectInputSource(src)
 }
 
 enum InputLang {
@@ -379,7 +375,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         selectSource(cur == .korean ? Config.english : Config.korean)
     }
 
-    private func selectJapanese() { selectSource(Config.japanese) }
+    private var warnedJapaneseDisabled = false
+    private func selectJapanese() {
+        if selectSource(Config.japanese) == -50 && !warnedJapaneseDisabled {
+            warnedJapaneseDisabled = true
+            let alert = NSAlert()
+            alert.messageText = "일본어 입력 소스를 켜야 합니다"
+            alert.informativeText = "시스템 설정 > 키보드 > 입력 소스 에서 "
+                + "‘일본어 - 로마자’를 추가해 주세요. 추가하면 ⌥⌘J 로 바로 전환됩니다."
+            alert.addButton(withTitle: "확인")
+            NSApp.activate(ignoringOtherApps: true)
+            alert.runModal()
+        }
+    }
     @objc private func menuEnglish()  { selectSource(Config.english) }
     @objc private func menuKorean()   { selectSource(Config.korean) }
     @objc private func menuJapanese() { selectJapanese() }
