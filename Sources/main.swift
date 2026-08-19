@@ -119,6 +119,88 @@ final class ModeSwitcher {
     }
 }
 
+// MARK: - Hotkey configuration & persistence
+
+struct HotKeyConfig: Equatable {
+    var keyCode: UInt32
+    var carbonModifiers: UInt32
+
+    /// Default: ⌥⌘J (option-command-J).
+    static let defaultConfig = HotKeyConfig(keyCode: UInt32(kVK_ANSI_J),
+                                            carbonModifiers: UInt32(optionKey | cmdKey))
+
+    static func load() -> HotKeyConfig {
+        let d = UserDefaults.standard
+        guard d.object(forKey: "hotkey.keyCode") != nil else { return .defaultConfig }
+        return HotKeyConfig(keyCode: UInt32(d.integer(forKey: "hotkey.keyCode")),
+                            carbonModifiers: UInt32(d.integer(forKey: "hotkey.carbonMods")))
+    }
+
+    func save() {
+        let d = UserDefaults.standard
+        d.set(Int(keyCode), forKey: "hotkey.keyCode")
+        d.set(Int(carbonModifiers), forKey: "hotkey.carbonMods")
+    }
+
+    /// e.g. "⌥⌘J" — a readable label for menus and the settings window.
+    var display: String {
+        var s = ""
+        if carbonModifiers & UInt32(controlKey) != 0 { s += "⌃" }
+        if carbonModifiers & UInt32(optionKey)  != 0 { s += "⌥" }
+        if carbonModifiers & UInt32(shiftKey)   != 0 { s += "⇧" }
+        if carbonModifiers & UInt32(cmdKey)     != 0 { s += "⌘" }
+        return s + KeyNames.name(for: keyCode)
+    }
+}
+
+/// Translates NSEvent modifier flags into Carbon hotkey modifier masks.
+func carbonModifiers(from flags: NSEvent.ModifierFlags) -> UInt32 {
+    var m: UInt32 = 0
+    if flags.contains(.command) { m |= UInt32(cmdKey) }
+    if flags.contains(.option)  { m |= UInt32(optionKey) }
+    if flags.contains(.control) { m |= UInt32(controlKey) }
+    if flags.contains(.shift)   { m |= UInt32(shiftKey) }
+    return m
+}
+
+/// Human-readable names for a handful of virtual key codes; letters/digits fall
+/// back to their typed character, everything else to "key<N>".
+enum KeyNames {
+    private static let special: [UInt32: String] = [
+        UInt32(kVK_Space): "Space", UInt32(kVK_Return): "Return",
+        UInt32(kVK_Tab): "Tab", UInt32(kVK_Escape): "Esc",
+        UInt32(kVK_F1): "F1", UInt32(kVK_F2): "F2", UInt32(kVK_F3): "F3",
+        UInt32(kVK_F4): "F4", UInt32(kVK_F5): "F5", UInt32(kVK_F6): "F6",
+        UInt32(kVK_F7): "F7", UInt32(kVK_F8): "F8", UInt32(kVK_F9): "F9",
+        UInt32(kVK_F10): "F10", UInt32(kVK_F11): "F11", UInt32(kVK_F12): "F12",
+    ]
+
+    static func name(for keyCode: UInt32) -> String {
+        if let s = special[keyCode] { return s }
+        if let ch = character(for: keyCode) { return ch.uppercased() }
+        return "key\(keyCode)"
+    }
+
+    /// Resolves the character a key produces using the current keyboard layout.
+    private static func character(for keyCode: UInt32) -> String? {
+        guard let src = TISCopyCurrentKeyboardLayoutInputSource()?.takeRetainedValue(),
+              let ptr = TISGetInputSourceProperty(src, kTISPropertyUnicodeKeyLayoutData)
+        else { return nil }
+        let data = Unmanaged<CFData>.fromOpaque(ptr).takeUnretainedValue() as Data
+        var deadKeys: UInt32 = 0
+        var chars = [UniChar](repeating: 0, count: 4)
+        var length = 0
+        let result = data.withUnsafeBytes { raw -> OSStatus in
+            let layout = raw.bindMemory(to: UCKeyboardLayout.self).baseAddress!
+            return UCKeyTranslate(layout, UInt16(keyCode), UInt16(kUCKeyActionDown), 0,
+                                  UInt32(LMGetKbdType()), OptionBits(kUCKeyTranslateNoDeadKeysBit),
+                                  &deadKeys, chars.count, &length, &chars)
+        }
+        guard result == noErr, length > 0 else { return nil }
+        return String(utf16CodeUnits: chars, count: length)
+    }
+}
+
 // MARK: - Global hotkey (Carbon, no accessibility permission needed)
 
 final class HotKey {
@@ -152,29 +234,146 @@ final class HotKey {
     }
 }
 
+// MARK: - Shortcut recorder button
+
+/// A button that, while armed, captures the next modifier+key combo the user presses.
+final class RecorderButton: NSButton {
+    var onCapture: ((HotKeyConfig) -> Void)?
+    private var recording = false
+    private var monitor: Any?
+    private var currentConfig: HotKeyConfig
+
+    init(config: HotKeyConfig) {
+        self.currentConfig = config
+        super.init(frame: .zero)
+        bezelStyle = .rounded
+        setButtonType(.momentaryPushIn)
+        target = self
+        action = #selector(toggle)
+        refreshTitle()
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    func update(config: HotKeyConfig) {
+        currentConfig = config
+        refreshTitle()
+    }
+
+    private func refreshTitle() {
+        title = recording ? "키 조합을 누르세요… (Esc 취소)" : currentConfig.display
+    }
+
+    @objc private func toggle() {
+        recording ? stop() : start()
+    }
+
+    private func start() {
+        recording = true
+        refreshTitle()
+        monitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown]) { [weak self] event in
+            guard let self = self else { return event }
+            if event.keyCode == UInt16(kVK_Escape) { self.stop(); return nil }
+            let mods = carbonModifiers(from: event.modifierFlags)
+            // Require at least one modifier so we don't grab bare keys.
+            guard mods != 0 else { return nil }
+            let config = HotKeyConfig(keyCode: UInt32(event.keyCode), carbonModifiers: mods)
+            self.currentConfig = config
+            self.stop()
+            self.onCapture?(config)
+            return nil
+        }
+    }
+
+    private func stop() {
+        recording = false
+        if let m = monitor { NSEvent.removeMonitor(m); monitor = nil }
+        refreshTitle()
+    }
+}
+
+// MARK: - Preferences window
+
+final class PreferencesWindowController: NSWindowController {
+    private let onChange: (HotKeyConfig) -> Void
+    private var recorder: RecorderButton!
+
+    init(config: HotKeyConfig, onChange: @escaping (HotKeyConfig) -> Void) {
+        self.onChange = onChange
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 380, height: 150),
+                              styleMask: [.titled, .closable],
+                              backing: .buffered, defer: false)
+        window.title = "IME Mode Switcher 설정"
+        super.init(window: window)
+        buildContent(config: config)
+        window.center()
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    private func buildContent(config: HotKeyConfig) {
+        guard let content = window?.contentView else { return }
+
+        let label = NSTextField(labelWithString: "모드 전환 단축키")
+        label.frame = NSRect(x: 20, y: 100, width: 340, height: 20)
+        content.addSubview(label)
+
+        recorder = RecorderButton(config: config)
+        recorder.frame = NSRect(x: 20, y: 62, width: 260, height: 30)
+        recorder.onCapture = { [weak self] cfg in
+            self?.onChange(cfg)
+        }
+        content.addSubview(recorder)
+
+        let reset = NSButton(title: "기본값", target: self, action: #selector(resetToDefault))
+        reset.bezelStyle = .rounded
+        reset.frame = NSRect(x: 285, y: 62, width: 75, height: 30)
+        content.addSubview(reset)
+
+        let hint = NSTextField(labelWithString: "버튼을 누른 뒤 원하는 조합(예: ⌥⌘J)을 눌러 지정합니다.")
+        hint.font = .systemFont(ofSize: 11)
+        hint.textColor = .secondaryLabelColor
+        hint.frame = NSRect(x: 20, y: 24, width: 340, height: 20)
+        content.addSubview(hint)
+    }
+
+    @objc private func resetToDefault() {
+        recorder.update(config: .defaultConfig)
+        onChange(.defaultConfig)
+    }
+
+    func show() {
+        NSApp.activate(ignoringOtherApps: true)
+        window?.makeKeyAndOrderFront(nil)
+    }
+}
+
 // MARK: - App
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
     private let switcher = ModeSwitcher()
     private var hotKey: HotKey?
+    private var config = HotKeyConfig.load()
     private var mode: Mode = .krEn {
         didSet { refreshUI() }
     }
     private var modeMenuItem: NSMenuItem!
+    private var hotkeyMenuItem: NSMenuItem!
+    private var prefsController: PreferencesWindowController?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         buildMenu()
-
-        // Default hotkey: ⌃⌥⌘J  (control-option-command-J)
-        hotKey = HotKey(keyCode: UInt32(kVK_ANSI_J),
-                        modifiers: UInt32(controlKey | optionKey | cmdKey)) { [weak self] in
-            self?.toggleMode()
-        }
+        registerHotKey()
 
         // Establish a known state on launch: 한/영 모드.
         setMode(.krEn)
+    }
+
+    private func registerHotKey() {
+        hotKey = HotKey(keyCode: config.keyCode, modifiers: config.carbonModifiers) { [weak self] in
+            self?.toggleMode()
+        }
+        hotkeyMenuItem?.title = "단축키: \(config.display) (모드 토글)"
     }
 
     private func buildMenu() {
@@ -193,9 +392,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(toJp)
 
         menu.addItem(.separator())
-        let hint = NSMenuItem(title: "단축키: ⌃⌥⌘J (모드 토글)", action: nil, keyEquivalent: "")
-        hint.isEnabled = false
-        menu.addItem(hint)
+        hotkeyMenuItem = NSMenuItem(title: "단축키: \(config.display) (모드 토글)", action: nil, keyEquivalent: "")
+        hotkeyMenuItem.isEnabled = false
+        menu.addItem(hotkeyMenuItem)
+
+        let prefs = NSMenuItem(title: "설정…", action: #selector(openPreferences), keyEquivalent: ",")
+        prefs.target = self
+        menu.addItem(prefs)
 
         menu.addItem(.separator())
         let quit = NSMenuItem(title: "종료", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
@@ -221,6 +424,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func switchToKrEn() { setMode(.krEn) }
     @objc private func switchToJp() { setMode(.jp) }
+
+    @objc private func openPreferences() {
+        if prefsController == nil {
+            prefsController = PreferencesWindowController(config: config) { [weak self] newConfig in
+                guard let self = self else { return }
+                self.config = newConfig
+                newConfig.save()
+                self.registerHotKey() // re-registers with the new combo
+            }
+        }
+        prefsController?.show()
+    }
 }
 
 let app = NSApplication.shared
