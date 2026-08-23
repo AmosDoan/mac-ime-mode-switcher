@@ -1,5 +1,39 @@
 # IME Mode Switcher
 
+A tiny macOS menu-bar app that makes switching between Korean, English, and
+Japanese input sources fast and predictable. Keep using **shift+space** for
+Korean ↔ English, without ever overshooting into Japanese.
+
+## English
+
+macOS's "select next input source" cycle (shift+space) walks **every** enabled
+source, so pressing it quickly can overshoot into input sources you didn't want
+(Japanese, Ainu, …). And on recent macOS the input-source *disable* API
+(`TISDisableInputSource`) no longer works, so you can't fix it by trimming the
+cycle.
+
+Instead, this app **intercepts the shift+space keystroke itself**, swallows the
+system cycle, and switches Korean ↔ English directly. It never lands on Japanese.
+
+- **shift+space** → Korean ↔ English (intercepted, selected directly)
+- **⌥⌘J** → 日本語 (Romaji), a dedicated key that can't overshoot
+- The menu-bar shows the current language (`한` / `A` / `あ`); you can also pick one from the menu.
+- The Japanese shortcut is configurable in the menu-bar `설정…` (Settings) window.
+
+**Requirements:** enable *Japanese – Romaji* in `System Settings > Keyboard >
+Input Sources` (the app only *selects* sources, never enables/disables them), and
+grant **Accessibility** permission so the app can intercept shift+space. Once
+granted, interception starts immediately (no relaunch needed).
+
+**Build:** run `./scripts/create-signing-identity.sh` once (a stable self-signed
+identity so the Accessibility grant survives rebuilds), then `./scripts/build.sh`
+and `open build/IMEModeSwitcher.app`. Toggle **로그인 시 자동 실행** (Launch at
+login) from the menu so the app is always running.
+
+The rest of this README is in Korean.
+
+---
+
 한/영/일 입력 소스를 빠르고 정확하게 전환하는 macOS 메뉴바 앱입니다.
 shift+space 로 한/영을 쓰던 습관은 그대로 두고, 일본어로 새는(오버슛) 문제만 없앱니다.
 
