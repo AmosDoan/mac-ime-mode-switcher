@@ -1,7 +1,6 @@
 import AppKit
 import Carbon
 import Carbon.HIToolbox
-import ServiceManagement
 
 // MARK: - Configuration
 
@@ -14,6 +13,73 @@ enum Config {
     /// Any source whose ID starts with this is treated as Korean.
     static let koreanPrefix   = "com.apple.inputmethod.Korean"
     static let japanesePrefix = "com.apple.inputmethod.Kotoeri"
+}
+
+// MARK: - Login item (LaunchAgent)
+
+/// Manages a per-user LaunchAgent so the app relaunches at login.
+/// We use a LaunchAgent instead of SMAppService because an ad-hoc / self-signed
+/// build does not register reliably with SMAppService on macOS 26.
+/// The agent launches the app's own binary directly (not `open`), so the entry
+/// in System Settings > Login Items shows the app name rather than "open".
+enum LoginItem {
+    static let label = "net.mossol.imemodeswitcher"
+
+    static var plistURL: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/LaunchAgents/\(label).plist")
+    }
+
+    static var isEnabled: Bool {
+        FileManager.default.fileExists(atPath: plistURL.path)
+    }
+
+    static func enable() throws {
+        // Launch the current bundle's executable directly. .accessory activation
+        // policy keeps it focus-free, so no `open -g` wrapper is needed.
+        let exec = Bundle.main.executableURL?.path
+            ?? (Bundle.main.bundlePath + "/Contents/MacOS/IMEModeSwitcher")
+        let plist: [String: Any] = [
+            "Label": label,
+            "ProgramArguments": [exec],
+            "RunAtLoad": true,
+            "ProcessType": "Interactive",
+        ]
+        let data = try PropertyListSerialization.data(
+            fromPropertyList: plist, format: .xml, options: 0)
+        try FileManager.default.createDirectory(
+            at: plistURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try data.write(to: plistURL)
+        runLaunchctl(["unload", plistURL.path])   // drop any stale registration
+        try runLaunchctlChecked(["load", "-w", plistURL.path])
+    }
+
+    static func disable() throws {
+        runLaunchctl(["unload", "-w", plistURL.path])
+        if FileManager.default.fileExists(atPath: plistURL.path) {
+            try FileManager.default.removeItem(at: plistURL)
+        }
+    }
+
+    @discardableResult
+    private static func runLaunchctl(_ args: [String]) -> Int32 {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+        p.arguments = args
+        try? p.run()
+        p.waitUntilExit()
+        return p.terminationStatus
+    }
+
+    private static func runLaunchctlChecked(_ args: [String]) throws {
+        let status = runLaunchctl(args)
+        if status != 0 {
+            throw NSError(domain: "LoginItem", code: Int(status), userInfo: [
+                NSLocalizedDescriptionKey:
+                    "launchctl \(args.joined(separator: " ")) exited with code \(status)"
+            ])
+        }
+    }
 }
 
 // MARK: - Input source helpers
@@ -485,15 +551,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func refreshLoginItemState() {
-        loginItemMenuItem?.state = (SMAppService.mainApp.status == .enabled) ? .on : .off
+        loginItemMenuItem?.state = LoginItem.isEnabled ? .on : .off
     }
 
     @objc private func toggleLoginItem() {
         do {
-            if SMAppService.mainApp.status == .enabled {
-                try SMAppService.mainApp.unregister()
+            if LoginItem.isEnabled {
+                try LoginItem.disable()
             } else {
-                try SMAppService.mainApp.register()
+                try LoginItem.enable()
             }
         } catch {
             let alert = NSAlert()
